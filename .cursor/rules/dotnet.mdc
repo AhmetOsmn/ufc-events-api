@@ -1,0 +1,9 @@
+---
+description: bu kuralları dotnet development'de uygulamalarısın
+globs:
+alwaysApply: true
+---
+
+- kod içerisine yorum satırı ekleme
+- c# geliştirmelerinde datalar dışında her zaman ingilizce kullan
+- senden istediğim geliştirme dışında ekstra bir şey yapmayı düşünürsen önce benden izin al
