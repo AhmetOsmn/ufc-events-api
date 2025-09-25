@@ -5,12 +5,14 @@ namespace UFC.Events.Api.Services;
 public class EventService : IEventService
 {
     private readonly IRedisCacheManager _cacheManager;
+    private readonly IUfcScraperService _ufcScraperService;
     private readonly ILogger<EventService> _logger;
     private const string EventsCacheKey = "ufc:events";
 
-    public EventService(IRedisCacheManager cacheManager, ILogger<EventService> logger)
+    public EventService(IRedisCacheManager cacheManager, IUfcScraperService ufcScraperService, ILogger<EventService> logger)
     {
         _cacheManager = cacheManager;
+        _ufcScraperService = ufcScraperService;
         _logger = logger;
     }
 
@@ -19,6 +21,15 @@ public class EventService : IEventService
         try
         {
             var events = await _cacheManager.GetAsync<List<Event>>(EventsCacheKey);
+            
+            // Cache'de veri yoksa veya cache süresi dolmuşsa, fresh data çek
+            if (events == null || !events.Any())
+            {
+                _logger.LogInformation("Cache'de event bulunamadı, fresh data çekiliyor...");
+                await LoadLatestEventsAsync();
+                events = await _cacheManager.GetAsync<List<Event>>(EventsCacheKey);
+            }
+            
             return events ?? new List<Event>();
         }
         catch (Exception ex)
@@ -56,158 +67,27 @@ public class EventService : IEventService
         }
     }
 
-    public async Task SeedMockDataAsync()
+    public async Task LoadLatestEventsAsync()
     {
         try
         {
-            // Cache'de zaten veri varsa tekrar ekleme
-            var existingEvents = await _cacheManager.GetAsync<List<Event>>(EventsCacheKey);
-            if (existingEvents != null && existingEvents.Count > 0)
+            _logger.LogInformation("UFC web sitesinden fresh event data çekiliyor...");
+            
+            var events = await _ufcScraperService.ScrapeUpcomingEventsAsync();
+            
+            if (events != null && events.Any())
             {
-                _logger.LogInformation("Cache'de zaten {Count} adet event mevcut", existingEvents.Count);
-                return;
+                await SetEventsAsync(events);
+                _logger.LogInformation("UFC web sitesinden {Count} adet event başarıyla cache'e eklendi", events.Count);
             }
-
-            var mockEvents = new List<Event>
+            else
             {
-                new Event
-                {
-                    Id = "ufc-310",
-                    EventDate = DateTime.Now.AddDays(30),
-                    EventTitle = "UFC 310: Pantoja vs Asakura",
-                    EventLocation = "Las Vegas, Nevada, USA",
-                    Fights = new List<Fight>
-                    {
-                        new Fight
-                        {
-                            WeightClass = "Flyweight Championship",
-                            Order = 1,
-                            Fighters = new List<Fighter>
-                            {
-                                new Fighter
-                                {
-                                    Name = "Alexandre Pantoja",
-                                    Country = "Brazil",
-                                    Ranking = 1,
-                                    Record = "28-5-0"
-                                },
-                                new Fighter
-                                {
-                                    Name = "Kai Asakura",
-                                    Country = "Japan",
-                                    Ranking = null,
-                                    Record = "21-4-0"
-                                }
-                            }
-                        },
-                        new Fight
-                        {
-                            WeightClass = "Welterweight",
-                            Order = 2,
-                            Fighters = new List<Fighter>
-                            {
-                                new Fighter
-                                {
-                                    Name = "Shavkat Rakhmonov",
-                                    Country = "Kazakhstan",
-                                    Ranking = 3,
-                                    Record = "18-0-0"
-                                },
-                                new Fighter
-                                {
-                                    Name = "Ian Machado Garry",
-                                    Country = "Ireland",
-                                    Ranking = 7,
-                                    Record = "15-0-0"
-                                }
-                            }
-                        },
-                        new Fight
-                        {
-                            WeightClass = "Heavyweight",
-                            Order = 3,
-                            Fighters = new List<Fighter>
-                            {
-                                new Fighter
-                                {
-                                    Name = "Ciryl Gane",
-                                    Country = "France",
-                                    Ranking = 2,
-                                    Record = "12-2-0"
-                                },
-                                new Fighter
-                                {
-                                    Name = "Alexander Volkov",
-                                    Country = "Russia",
-                                    Ranking = 4,
-                                    Record = "38-10-0"
-                                }
-                            }
-                        }
-                    }
-                },
-                new Event
-                {
-                    Id = "ufc-311",
-                    EventDate = DateTime.Now.AddDays(60),
-                    EventTitle = "UFC 311: Islam vs Arman",
-                    EventLocation = "Los Angeles, California, USA",
-                    Fights = new List<Fight>
-                    {
-                        new Fight
-                        {
-                            WeightClass = "Lightweight Championship",
-                            Order = 1,
-                            Fighters = new List<Fighter>
-                            {
-                                new Fighter
-                                {
-                                    Name = "Islam Makhachev",
-                                    Country = "Russia",
-                                    Ranking = 1,
-                                    Record = "26-1-0"
-                                },
-                                new Fighter
-                                {
-                                    Name = "Arman Tsarukyan",
-                                    Country = "Armenia",
-                                    Ranking = 2,
-                                    Record = "22-3-0"
-                                }
-                            }
-                        },
-                        new Fight
-                        {
-                            WeightClass = "Bantamweight Championship",
-                            Order = 2,
-                            Fighters = new List<Fighter>
-                            {
-                                new Fighter
-                                {
-                                    Name = "Sean O'Malley",
-                                    Country = "USA",
-                                    Ranking = 1,
-                                    Record = "18-1-0"
-                                },
-                                new Fighter
-                                {
-                                    Name = "Umar Nurmagomedov",
-                                    Country = "Russia",
-                                    Ranking = 2,
-                                    Record = "18-0-0"
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-
-            await SetEventsAsync(mockEvents);
-            _logger.LogInformation("Mock data başarıyla cache'e eklendi: {Count} event", mockEvents.Count);
+                _logger.LogWarning("UFC web sitesinden event çekilemedi");
+            }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Mock data eklenirken hata oluştu");
+            _logger.LogError(ex, "UFC event data yüklenirken hata oluştu");
             throw;
         }
     }

@@ -23,8 +23,14 @@ builder.Services.AddSingleton<IConnectionMultiplexer>(provider =>
     return ConnectionMultiplexer.Connect(configuration);
 });
 
+// HttpClient for web scraping
+builder.Services.AddHttpClient();
+
 // Redis Cache Manager
 builder.Services.AddScoped<IRedisCacheManager, RedisCacheManager>();
+
+// UFC Scraper Service
+builder.Services.AddScoped<IUfcScraperService, UfcScraperService>();
 
 // Event Service
 builder.Services.AddScoped<IEventService, EventService>();
@@ -53,11 +59,39 @@ app.MapGet("/events", async (IEventService eventService) =>
 .WithName("GetEvents")
 .Produces<List<Event>>();
 
-// Mock data seed
+// Manual refresh endpoint
+app.MapPost("/events/refresh", async (IEventService eventService) =>
+{
+    try
+    {
+        await eventService.LoadLatestEventsAsync();
+        var events = await eventService.GetAllEventsAsync();
+        return Results.Ok(new { message = "Events refreshed successfully", count = events.Count });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Error refreshing events: {ex.Message}");
+    }
+})
+.WithName("RefreshEvents")
+.Produces<object>();
+
+// Load fresh UFC events data on startup
 using (var scope = app.Services.CreateScope())
 {
     var eventService = scope.ServiceProvider.GetRequiredService<IEventService>();
-    await eventService.SeedMockDataAsync();
+    var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
+    
+    try
+    {
+        logger.LogInformation("Uygulama başlatılırken UFC event data yükleniyor...");
+        await eventService.LoadLatestEventsAsync();
+        logger.LogInformation("UFC event data başarıyla yüklendi");
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "UFC event data yüklenirken hata oluştu, uygulama yine de başlatılacak");
+    }
 }
 
 app.Run();
