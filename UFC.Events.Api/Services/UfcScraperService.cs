@@ -1,6 +1,4 @@
 using HtmlAgilityPack;
-using System.Globalization;
-using System.Text.RegularExpressions;
 using UFC.Events.Api.Models;
 
 namespace UFC.Events.Api.Services;
@@ -15,326 +13,226 @@ public class UfcScraperService : IUfcScraperService
     {
         _httpClient = httpClient;
         _logger = logger;
-        
-        _httpClient.DefaultRequestHeaders.Add("User-Agent", 
+
+        _httpClient.DefaultRequestHeaders.Add("User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36");
     }
 
     public async Task<List<Event>> ScrapeUpcomingEventsAsync()
     {
-        try
+        _logger.LogInformation("UFC events scraping başlatılıyor...");
+
+        var html = await _httpClient.GetStringAsync(UFC_EVENTS_URL);
+        var doc = new HtmlDocument();
+        doc.LoadHtml(html);
+
+        var eventNodes = GetEventNodes(doc);
+        var events = new List<Event>();
+
+        foreach (var eventNode in eventNodes)
         {
-            _logger.LogInformation("UFC events scraping başlatılıyor...");
-            
-            var html = await _httpClient.GetStringAsync(UFC_EVENTS_URL);
-            var doc = new HtmlDocument();
-            doc.LoadHtml(html);
-
-            var events = new List<Event>();
-            
-            // UFC events page'deki event card'larını bul
-            var eventCards = doc.DocumentNode
-                .SelectNodes("//div[contains(@class, 'c-card-event')]") ?? 
-                doc.DocumentNode.SelectNodes("//div[contains(@class, 'event-card')]") ??
-                doc.DocumentNode.SelectNodes("//div[contains(@class, 'view-upcoming-events')]//div[contains(@class, 'views-row')]");
-
-            if (eventCards == null || !eventCards.Any())
+            try
             {
-                _logger.LogWarning("Event card'lar bulunamadı, alternatif selector deneniyor...");
-                
-                // Alternatif selector'lar
-                eventCards = doc.DocumentNode
-                    .SelectNodes("//article[contains(@class, 'event')]") ??
-                    doc.DocumentNode.SelectNodes("//div[contains(@class, 'upcoming')]//div[contains(@class, 'event')]");
-            }
-
-            if (eventCards != null)
-            {
-                foreach (var card in eventCards.Take(10)) // İlk 10 eventi al
+                var eventObj = await ParseEventFromNodeAsync(eventNode);
+                if (eventObj != null)
                 {
-                    try
-                    {
-                        var eventData = ExtractEventData(card);
-                        if (eventData != null)
-                        {
-                            events.Add(eventData);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Event card parse edilirken hata: {Html}", card.OuterHtml.Substring(0, Math.Min(200, card.OuterHtml.Length)));
-                    }
+                    events.Add(eventObj);
                 }
             }
-
-            // Eğer hiç event bulunamadıysa fallback data oluştur
-            if (!events.Any())
+            catch (Exception ex)
             {
-                _logger.LogWarning("Hiç event scrape edilemedi, fallback data oluşturuluyor...");
-                events = CreateFallbackEvents();
+                _logger.LogWarning("Event parsing hatası: {Error}", ex.Message);
             }
+        }
 
-            _logger.LogInformation("{Count} adet event başarıyla scrape edildi", events.Count);
-            return events;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "UFC events scraping sırasında hata oluştu");
-            
-            // Hata durumunda fallback data döndür
-            return CreateFallbackEvents();
-        }
+        _logger.LogInformation("{Count} adet event başarıyla parse edildi", events.Count);
+        return events;
     }
 
-    private Event? ExtractEventData(HtmlNode cardNode)
+    private HtmlNodeCollection GetEventNodes(HtmlDocument document)
+    {
+        return document.DocumentNode.SelectNodes("//details[@id='events-list-upcoming']//div[@class='l-listing__item views-row']");
+    }
+
+    private async Task<Event?> ParseEventFromNodeAsync(HtmlNode eventNode)
     {
         try
         {
-            // Event title
-            var titleNode = cardNode.SelectSingleNode(".//h3") ?? 
-                           cardNode.SelectSingleNode(".//h2") ?? 
-                           cardNode.SelectSingleNode(".//*[contains(@class, 'title')]//text()") ?? 
-                           cardNode.SelectSingleNode(".//*[contains(@class, 'event-title')]");
-            
-            var title = titleNode?.InnerText?.Trim() ?? "UFC Event";
+            var eventObj = new Event();
 
-            // Event date
-            var dateNode = cardNode.SelectSingleNode(".//*[contains(@class, 'date')]") ?? 
-                          cardNode.SelectSingleNode(".//*[@datetime]") ?? 
-                          cardNode.SelectSingleNode(".//*[contains(@class, 'time')]");
-            
-            var dateText = dateNode?.InnerText?.Trim() ?? dateNode?.GetAttributeValue("datetime", "") ?? "";
-            var eventDate = ParseEventDate(dateText);
+            var detailUrl = GetEventDetailUrl(eventNode);
+            if (string.IsNullOrEmpty(detailUrl)) return null;
 
-            // Event location
-            var locationNode = cardNode.SelectSingleNode(".//*[contains(@class, 'location')]") ?? 
-                              cardNode.SelectSingleNode(".//*[contains(@class, 'venue')]") ?? 
-                              cardNode.SelectSingleNode(".//*[contains(@class, 'city')]");
-            
-            var location = locationNode?.InnerText?.Trim() ?? "TBD";
+            var detailHtml = await _httpClient.GetStringAsync(detailUrl);
+            var detailDoc = new HtmlDocument();
+            detailDoc.LoadHtml(detailHtml);
 
-            // Fight card bilgileri (varsa)
-            var fights = ExtractFights(cardNode);
-
-            return new Event
+            // Event Title'ı event node'undan al
+            var titleNode = eventNode.SelectSingleNode(".//h3[@class='c-card-event--result__headline']/a");
+            if (titleNode != null)
             {
-                Id = GenerateEventId(title),
-                EventTitle = CleanText(title),
-                EventDate = eventDate,
-                EventLocation = CleanText(location),
-                Fights = fights
-            };
+                eventObj.EventTitle = titleNode.InnerText?.Trim() ?? string.Empty;
+            }
+
+            // Event Date'i event node'undan al
+            var dateNode = eventNode.SelectSingleNode(".//div[@class='c-card-event--result__date tz-change-data']");
+            if (dateNode != null)
+            {
+                var timestampAttr = dateNode.GetAttributeValue("data-main-card-timestamp", "");
+                if (!string.IsNullOrEmpty(timestampAttr) && long.TryParse(timestampAttr, out var timestamp))
+                {
+                    eventObj.EventDate = DateTimeOffset.FromUnixTimeSeconds(timestamp).DateTime;
+                }
+            }
+
+            // Event Location'ı event node'undan al (Venue + City + State + Country)
+            var venueNode = eventNode.SelectSingleNode(".//div[@class='e-p--small c-card-event--result__location']//h5");
+            var cityNode = eventNode.SelectSingleNode(".//div[@class='e-p--small c-card-event--result__location']//span[@class='locality']");
+            var stateNode = eventNode.SelectSingleNode(".//div[@class='e-p--small c-card-event--result__location']//span[@class='administrative-area']");
+            var countryNode = eventNode.SelectSingleNode(".//div[@class='e-p--small c-card-event--result__location']//span[@class='country']");
+
+            var locationParts = new List<string>();
+
+            // Venue bilgisi
+            if (venueNode != null && !string.IsNullOrWhiteSpace(venueNode.InnerText))
+            {
+                locationParts.Add(venueNode.InnerText.Trim());
+            }
+
+            // City, State, Country bilgilerini birleştir
+            var addressParts = new List<string>();
+            if (cityNode != null && !string.IsNullOrWhiteSpace(cityNode.InnerText))
+            {
+                addressParts.Add(cityNode.InnerText.Trim());
+            }
+            if (stateNode != null && !string.IsNullOrWhiteSpace(stateNode.InnerText))
+            {
+                addressParts.Add(stateNode.InnerText.Trim());
+            }
+            if (countryNode != null && !string.IsNullOrWhiteSpace(countryNode.InnerText))
+            {
+                addressParts.Add(countryNode.InnerText.Trim());
+            }
+
+            if (addressParts.Count > 0)
+            {
+                locationParts.Add(string.Join(" ", addressParts));
+            }
+
+            eventObj.EventLocation = locationParts.Count > 0 ? string.Join(" - ", locationParts) : string.Empty;
+
+            // Fight'ları detay sayfasından al
+            var fightNodes = detailDoc.DocumentNode.SelectNodes("//li[@class='l-listing__item']");
+            if (fightNodes != null)
+            {
+                var fights = new List<Fight>();
+                for (int i = 0; i < fightNodes.Count; i++)
+                {
+                    // Order'ı tersine çevir: HTML'deki ilk fight en son oynanacak fight olduğu için en yüksek order'a sahip olmalı
+                    var order = fightNodes.Count - i;
+                    var fight = ParseFightFromDetailNode(fightNodes[i], order);
+                    if (fight != null)
+                    {
+                        fights.Add(fight);
+                    }
+                }
+                eventObj.Fights = fights;
+            }
+
+            return eventObj;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Event data extraction sırasında hata");
+            _logger.LogError("Event node parsing hatası: {Error}", ex.Message);
             return null;
         }
     }
 
-    private List<Fight> ExtractFights(HtmlNode cardNode)
+    private Fight? ParseFightFromDetailNode(HtmlNode fightNode, int order)
     {
-        var fights = new List<Fight>();
-        
-        try
+        var fight = new Fight { Order = order };
+
+        // Weight class bilgisini al
+        var weightClassNode = fightNode.SelectSingleNode(".//div[@class='c-listing-fight__class-text']");
+        if (weightClassNode != null)
         {
-            // Main event ve featured fights
-            var fightNodes = cardNode.SelectNodes(".//*[contains(@class, 'fight')]") ?? 
-                           cardNode.SelectNodes(".//*[contains(@class, 'bout')]") ?? 
-                           cardNode.SelectNodes(".//*[contains(@class, 'matchup')]");
-
-            if (fightNodes != null)
-            {
-                int order = 1;
-                foreach (var fightNode in fightNodes.Take(5)) // Maksimum 5 fight
-                {
-                    var fight = ExtractSingleFight(fightNode, order);
-                    if (fight != null)
-                    {
-                        fights.Add(fight);
-                        order++;
-                    }
-                }
-            }
-
-            // Eğer fight bulunamadıysa, fighter isimlerini bul
-            if (!fights.Any())
-            {
-                var fighterNames = cardNode.SelectNodes(".//*[contains(@class, 'fighter')]") ?? 
-                                 cardNode.SelectNodes(".//*[contains(@class, 'athlete')]");
-
-                if (fighterNames != null && fighterNames.Count >= 2)
-                {
-                    var mainEvent = new Fight
-                    {
-                        WeightClass = "Main Event",
-                        Order = 1,
-                        Fighters = fighterNames.Take(2).Select(fn => new Fighter 
-                        { 
-                            Name = CleanText(fn.InnerText),
-                            Country = "TBD",
-                            Record = "TBD"
-                        }).ToList()
-                    };
-                    fights.Add(mainEvent);
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Fight extraction sırasında hata");
+            fight.WeightClass = weightClassNode.InnerText?.Trim() ?? string.Empty;
         }
 
-        return fights;
+        var fighters = new List<Fighter>();
+
+        // Red corner fighter'ı parse et
+        var redFighter = ParseFighterFromDetailNode(fightNode, "red");
+        if (redFighter != null)
+        {
+            fighters.Add(redFighter);
+        }
+
+        var blueFighter = ParseFighterFromDetailNode(fightNode, "blue");
+        if (blueFighter != null)
+        {
+            fighters.Add(blueFighter);
+        }
+
+        fight.Fighters = fighters;
+
+        return fight.Fighters.Count >= 2 ? fight : null;
     }
 
-    private Fight? ExtractSingleFight(HtmlNode fightNode, int order)
+    private static Fighter? ParseFighterFromDetailNode(HtmlNode fightNode, string corner)
     {
-        try
-        {
-            var fighters = new List<Fighter>();
-            
-            // Fighter isimlerini bul
-            var fighterNodes = fightNode.SelectNodes(".//*[contains(@class, 'fighter-name')]") ?? 
-                             fightNode.SelectNodes(".//span[contains(@class, 'name')]") ?? 
-                             fightNode.SelectNodes(".//div[contains(@class, 'athlete')]");
+        var fighter = new Fighter();
 
-            if (fighterNodes != null)
+        // Fighter name'ini al (given name + family name)
+        var givenNameNode = fightNode.SelectSingleNode($".//div[@class='c-listing-fight__corner-name c-listing-fight__corner-name--{corner}']//span[@class='c-listing-fight__corner-given-name']");
+        var familyNameNode = fightNode.SelectSingleNode($".//div[@class='c-listing-fight__corner-name c-listing-fight__corner-name--{corner}']//span[@class='c-listing-fight__corner-family-name']");
+
+        if (givenNameNode != null && familyNameNode != null)
+        {
+            var givenName = givenNameNode.InnerText?.Trim() ?? "";
+            var familyName = familyNameNode.InnerText?.Trim() ?? "";
+            fighter.Name = $"{givenName} {familyName}";
+        }
+
+        // Fighter ranking'ini al
+        var rankNodes = fightNode.SelectNodes(".//div[@class='js-listing-fight__corner-rank c-listing-fight__corner-rank']/span");
+        if (rankNodes != null && rankNodes.Count >= 2)
+        {
+            var rankText = corner == "red" ? rankNodes[0].InnerText?.Trim() : rankNodes[1].InnerText?.Trim();
+            if (!string.IsNullOrEmpty(rankText) && rankText.StartsWith("#"))
             {
-                foreach (var fighterNode in fighterNodes.Take(2))
+                if (int.TryParse(rankText.Substring(1), out var rank))
                 {
-                    var name = CleanText(fighterNode.InnerText);
-                    if (!string.IsNullOrEmpty(name))
-                    {
-                        fighters.Add(new Fighter
-                        {
-                            Name = name,
-                            Country = "TBD",
-                            Record = "TBD"
-                        });
-                    }
+                    fighter.Ranking = rank;
                 }
             }
+        }
 
-            // Weight class
-            var weightClassNode = fightNode.SelectSingleNode(".//*[contains(@class, 'weight')]") ?? 
-                                fightNode.SelectSingleNode(".//*[contains(@class, 'division')]");
-            
-            var weightClass = weightClassNode?.InnerText?.Trim() ?? (order == 1 ? "Main Event" : "Fight");
+        // Fighter country'sini al
+        var countryNode = fightNode.SelectSingleNode($".//div[@class='c-listing-fight__country c-listing-fight__country--{corner}']//div[@class='c-listing-fight__country-text']");
+        if (countryNode != null)
+        {
+            fighter.Country = countryNode.InnerText?.Trim() ?? "";
+        }
 
-            if (fighters.Count >= 2)
+        return fighter;
+    }
+
+    private static string? GetEventDetailUrl(HtmlNode eventNode)
+    {
+        var detailLinkNode = eventNode.SelectSingleNode(".//div[@class='btn-container event-details-button']/a");
+        if (detailLinkNode != null)
+        {
+            var href = detailLinkNode.GetAttributeValue("href", "");
+            if (!string.IsNullOrEmpty(href))
             {
-                return new Fight
+                if (href.StartsWith("/"))
                 {
-                    WeightClass = CleanText(weightClass),
-                    Order = order,
-                    Fighters = fighters
-                };
+                    return $"https://www.ufc.com{href}";
+                }
+                return href;
             }
         }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Single fight extraction sırasında hata");
-        }
-
         return null;
-    }
-
-    private DateTime ParseEventDate(string dateText)
-    {
-        if (string.IsNullOrEmpty(dateText))
-            return DateTime.Now.AddDays(30);
-
-        try
-        {
-            // Çeşitli tarih formatlarını dene
-            var formats = new[]
-            {
-                "yyyy-MM-dd",
-                "MM/dd/yyyy",
-                "dd/MM/yyyy",
-                "MMM dd, yyyy",
-                "MMMM dd, yyyy",
-                "dd MMM yyyy",
-                "dd MMMM yyyy"
-            };
-
-            // HTML datetime attribute
-            if (DateTime.TryParse(dateText, out DateTime result))
-                return result;
-
-            // Regex ile tarih çıkar
-            var dateRegex = new Regex(@"(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})|(\w+)\s+(\d{1,2}),?\s+(\d{4})");
-            var match = dateRegex.Match(dateText);
-            
-            if (match.Success)
-            {
-                if (DateTime.TryParseExact(match.Value, formats, CultureInfo.InvariantCulture, DateTimeStyles.None, out result))
-                    return result;
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Tarih parse edilemedi: {DateText}", dateText);
-        }
-
-        // Default olarak 30 gün sonrası
-        return DateTime.Now.AddDays(30);
-    }
-
-    private string GenerateEventId(string title)
-    {
-        if (string.IsNullOrEmpty(title))
-            return Guid.NewGuid().ToString();
-
-        // UFC XXX formatını bul
-        var ufcMatch = Regex.Match(title, @"UFC\s+(\d+)", RegexOptions.IgnoreCase);
-        if (ufcMatch.Success)
-            return $"ufc-{ufcMatch.Groups[1].Value}";
-
-        // Başlığı temizle ve ID yap
-        var cleanTitle = Regex.Replace(title.ToLower(), @"[^\w\s-]", "")
-                              .Replace(" ", "-")
-                              .Replace("--", "-")
-                              .Trim('-');
-
-        return cleanTitle.Substring(0, Math.Min(50, cleanTitle.Length));
-    }
-
-    private string CleanText(string text)
-    {
-        if (string.IsNullOrEmpty(text))
-            return string.Empty;
-
-        return Regex.Replace(text.Trim(), @"\s+", " ");
-    }
-
-    private List<Event> CreateFallbackEvents()
-    {
-        _logger.LogInformation("Fallback events oluşturuluyor...");
-        
-        return new List<Event>
-        {
-            new Event
-            {
-                Id = "ufc-upcoming-1",
-                EventDate = DateTime.Now.AddDays(30),
-                EventTitle = "Upcoming UFC Event",
-                EventLocation = "Las Vegas, Nevada, USA",
-                Fights = new List<Fight>
-                {
-                    new Fight
-                    {
-                        WeightClass = "Main Event",
-                        Order = 1,
-                        Fighters = new List<Fighter>
-                        {
-                            new Fighter { Name = "Fighter A", Country = "USA", Record = "TBD" },
-                            new Fighter { Name = "Fighter B", Country = "Brazil", Record = "TBD" }
-                        }
-                    }
-                }
-            }
-        };
     }
 }
